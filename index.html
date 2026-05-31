@@ -74,6 +74,7 @@ attribute vec2 p; void main(){ gl_Position = vec4(p,0.,1.); }
 <script id="frag" type="x-shader/x-fragment">
 precision highp float;
 #define MAXL 16
+#define MAXSEG 12
 
 uniform vec2  u_res;
 uniform float u_time;
@@ -83,6 +84,10 @@ uniform vec2  u_bgRes;
 uniform int   u_nLobes;
 uniform vec2  u_lobePos[MAXL]; // ndc, relative to pointer (x already *aspect)
 uniform float u_lobeR[MAXL];   // ndc radius
+uniform int   u_nSegs;         // capsule segments (smooth tubes: strand / membrane)
+uniform vec2  u_segA[MAXSEG];
+uniform vec2  u_segB[MAXSEG];
+uniform float u_segR[MAXSEG];
 uniform float u_disp;
 uniform float u_refract;
 uniform float u_wave;          // 0..1 stretch/wave amount
@@ -115,12 +120,21 @@ float smin(float a, float b, float k){
   float h = clamp(0.5 + 0.5*(b-a)/k, 0.0, 1.0);
   return mix(b, a, h) - k*h*(1.0-h);
 }
+float sdSeg(vec2 p, vec2 a, vec2 b, float r){       // capsule: rounded line segment
+  vec2 pa = p-a, ba = b-a;
+  float h = clamp(dot(pa,ba)/max(dot(ba,ba),1e-6), 0.0, 1.0);
+  return length(pa - ba*h) - r;
+}
 float sceneSDF(vec2 q){
   float D = 1e3;
   for(int i=0;i<MAXL;i++){
     if(i>=u_nLobes) break;
     float di = length(q - u_lobePos[i]) - u_lobeR[i]; // circle SDF (negative inside)
     D = smin(D, di, u_smink);
+  }
+  for(int i=0;i<MAXSEG;i++){
+    if(i>=u_nSegs) break;
+    D = smin(D, sdSeg(q, u_segA[i], u_segB[i], u_segR[i]), u_smink);
   }
   return D;
 }
@@ -238,6 +252,7 @@ gl.enableVertexAttribArray(ploc); gl.vertexAttribPointer(ploc,2,gl.FLOAT,false,0
 const U=n=>gl.getUniformLocation(prog,n);
 const u={res:U('u_res'),time:U('u_time'),pointer:U('u_pointer'),bg:U('u_bg'),bgRes:U('u_bgRes'),
   nLobes:U('u_nLobes'),lobePos:U('u_lobePos'),lobeR:U('u_lobeR'),
+  nSegs:U('u_nSegs'),segA:U('u_segA'),segB:U('u_segB'),segR:U('u_segR'),
   disp:U('u_disp'),refract:U('u_refract'),wave:U('u_wave'),mirror:U('u_mirror'),
   waveFreq:U('u_waveFreq'),thr:U('u_thr'),rim:U('u_rim'),
   stretch:U('u_stretch'),two:U('u_two'),wrinkle:U('u_wrinkle'),wrinkleScale:U('u_wrinkleScale'),irid:U('u_irid'),smink:U('u_smink')};
@@ -489,34 +504,34 @@ function stepSim(an){
   }
 }
 
-// single hand -> one connected slime over palm+knuckles, plus the simulated drip strand
+// single hand -> one connected slime over palm+knuckles, with the drip as a smooth capsule strand
 function lobesOneHand(an){
   const aspect=cvs.width/cvs.height, palm=an.A, span=an.span;
+  const nd=s=>[(s.x-palm.x)*aspect,(s.yUp-palm.yUp)];
   const pos=[[0,0]], r=[tw.palm*span*tw.size];                  // palm core (covers the hand)
-  if(an.mcpsA) an.mcpsA.forEach(s=>{                            // knuckle lobes — close to palm so they always merge
-    pos.push([(s.x-palm.x)*aspect,(s.yUp-palm.yUp)]); r.push(tw.tip*span*tw.size*1.5); });
-  if(sim) for(let i=1;i<sim.nodes.length;i++){ const n=sim.nodes[i], pv=sim.nodes[i-1];
-    const seg=Math.hypot((n.x-pv.x)*aspect,(n.y-pv.y));
-    pos.push([(n.x-palm.x)*aspect,(n.y-palm.yUp)]); r.push(Math.max(tw.tip*span*tw.size, seg*0.7)); }
+  if(an.mcpsA) an.mcpsA.forEach(s=>{ pos.push(nd(s)); r.push(tw.tip*span*tw.size*1.5); }); // knuckles
+  const segs=[]; const sr=tw.tip*span*tw.size*0.9;
+  if(sim) for(let i=0;i<sim.nodes.length-1;i++){ const a=sim.nodes[i], b=sim.nodes[i+1];
+    segs.push([(a.x-palm.x)*aspect,(a.y-palm.yUp),(b.x-palm.x)*aspect,(b.y-palm.yUp),sr]); }
   let open=0; if(an.fingsA){ an.fingsA.forEach(s=>open+=Math.hypot(s.x-palm.x,s.yUp-palm.yUp)); open/=an.fingsA.length; }
   const wave=Math.max(tw.wave, Math.min(1,(open/span-0.55)/0.5));
-  return {pointer:{x:palm.x,y:palm.yUp}, pos, r, n:Math.min(pos.length,16), wave, stretch:[0,1], two:0};
+  return {pointer:{x:palm.x,y:palm.yUp}, pos, r, n:Math.min(pos.length,16), segs, wave, stretch:[0,1], two:0};
 }
 
-// two hands -> the simulated sheet/membrane stretched between the palms
+// two hands -> the simulated sheet/membrane as a smooth capsule chain between the palms
 function lobesTwoHands(an){
   const aspect=cvs.width/cvs.height, A=an.A, B=an.B;
   const M={x:(A.x+B.x)/2, yUp:(A.yUp+B.yUp)/2};
-  const toNdc=s=>[(s.x-M.x)*aspect,(s.yUp-M.yUp)];
+  const nd=(x,y)=>[(x-M.x)*aspect,(y-M.yUp)];
   const width=tw.memWidth*an.span*tw.size;
-  const pos=[[(A.x-M.x)*aspect,(A.yUp-M.yUp)],[(B.x-M.x)*aspect,(B.yUp-M.yUp)]];
+  const pos=[nd(A.x,A.yUp), nd(B.x,B.yUp)];                 // palm caps
   const r=[0.42*an.spanA*tw.size, 0.42*an.spanB*tw.size];
-  if(sim) for(let i=1;i<sim.nodes.length-1;i++){ const n=sim.nodes[i], nx=sim.nodes[i+1];
-    const seg=Math.hypot((nx.x-n.x)*aspect,(nx.y-n.y));   // keep radius >= spacing so lobes overlap
-    pos.push([(n.x-M.x)*aspect,(n.y-M.yUp)]); r.push(Math.max(width, seg*0.75)); }
+  const segs=[];
+  if(sim) for(let i=0;i<sim.nodes.length-1;i++){ const a=sim.nodes[i], b=sim.nodes[i+1];
+    segs.push([(a.x-M.x)*aspect,(a.y-M.yUp),(b.x-M.x)*aspect,(b.y-M.yUp),width]); }
   let dx=(B.x-A.x)*aspect, dy=(B.yUp-A.yUp); const Ld=Math.hypot(dx,dy)||1; dx/=Ld; dy/=Ld;
   const dist=Math.hypot((B.x-A.x)*aspect,B.yUp-A.yUp), taut=Math.min(1,dist/(an.span*4.5));
-  return {pointer:{x:M.x,y:M.yUp}, pos, r, n:Math.min(pos.length,16), wave:Math.max(tw.wave,taut), stretch:[dx,dy], two:1};
+  return {pointer:{x:M.x,y:M.yUp}, pos, r, n:Math.min(pos.length,16), segs, wave:Math.max(tw.wave,taut), stretch:[dx,dy], two:1};
 }
 
 // procedural orbiting lobes around the cursor (no-hand fallback)
@@ -574,9 +589,15 @@ function frame(now){
     const res=handLandmarker.detectForVideo(video, now);
     if(res.landmarks && res.landmarks.length){
       lastHands=res.landmarks; handSeenAt=t;
+      let twoOK=false, A, B;
       if(res.landmarks.length>=2){
-        let A=handInfo(res.landmarks[0]), B=handInfo(res.landmarks[1]);
+        A=handInfo(res.landmarks[0]); B=handInfo(res.landmarks[1]);
         if(A.palm.x>B.palm.x){ const m=A; A=B; B=m; }   // order left -> right
+        const dp=Math.hypot(B.palm.x-A.palm.x,B.palm.yUp-A.palm.yUp), av=(A.span+B.span)/2;
+        const ratio=Math.max(A.span,B.span)/Math.max(1e-3,Math.min(A.span,B.span));
+        twoOK = dp < av*7 && ratio < 3.0;   // reject a far-away / size-mismatched 2nd detection
+      }
+      if(twoOK){
         tA=A.palm; tB=B.palm; spanA=A.span; spanB=B.span; span=(A.span+B.span)/2;
         fingsA=A.tips; fingsB=B.tips; mcpsA=A.mcps; mcpsB=B.mcps; lastTwoAt=t;
         if(curMode!=='two'){ curMode='two'; needRebuild=true; }
@@ -620,6 +641,9 @@ function frame(now){
 
   const flatPos=new Float32Array(32), flatR=new Float32Array(16);
   for(let i=0;i<lobes.n;i++){ flatPos[i*2]=lobes.pos[i][0]; flatPos[i*2+1]=lobes.pos[i][1]; flatR[i]=lobes.r[i]; }
+  const segs=lobes.segs||[], nseg=Math.min(segs.length,12);
+  const segA=new Float32Array(24), segB=new Float32Array(24), segR=new Float32Array(12);
+  for(let i=0;i<nseg;i++){ segA[i*2]=segs[i][0]; segA[i*2+1]=segs[i][1]; segB[i*2]=segs[i][2]; segB[i*2+1]=segs[i][3]; segR[i]=segs[i][4]; }
 
   gl.uniform2f(u.res,cvs.width,cvs.height);
   gl.uniform1f(u.time,t);
@@ -628,6 +652,10 @@ function frame(now){
   gl.uniform1i(u.nLobes,lobes.n);
   gl.uniform2fv(u.lobePos,flatPos);
   gl.uniform1fv(u.lobeR,flatR);
+  gl.uniform1i(u.nSegs,nseg);
+  gl.uniform2fv(u.segA,segA);
+  gl.uniform2fv(u.segB,segB);
+  gl.uniform1fv(u.segR,segR);
   gl.uniform1f(u.disp,tw.disp);
   gl.uniform1f(u.refract,tw.refract);
   gl.uniform1f(u.wave,wave);
