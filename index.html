@@ -312,14 +312,17 @@ async function initHands(){
 // ---- interaction ----
 let pointer={x:.5,y:.5}, target={x:.5,y:.5}, frozen=false, debug=true;
 let lastLandmarks=null, lastHands=[], lastLobes=null;
-// persisted hand result — reused between detections (render fps > camera fps) so the blob doesn't flicker
-let lastHandLobes=null, lastHandWave=0, handSeenAt=-10, handFresh=false;
+// persisted hand state — anchors are eased palm targets; the verlet sim runs every
+// render frame off them, so motion stays smooth between detections (and doesn't flicker)
+let handSeenAt=-10, handFresh=false, curMode=null, needRebuild=false, lastTwoAt=-10;
+let anchorA=null, anchorB=null, tA=null, tB=null, spanA=0.2, spanB=0.2, span=0.2, fingsA=null, fingsB=null;
 
 // ---- tweakable parameters (driven by the slider panel) ----
 const DEFAULTS={
   refract:0.11, disp:0.06, wave:0.0, waveFreq:200, thr:1.0, rim:1.0,
-  size:1.0, palm:0.62, tip:0.26, follow:0.18,
-  wrinkle:0.6, wrinkleScale:7, irid:0.25, sag:0.5, memWidth:0.5
+  size:0.9, palm:0.5, tip:0.2, follow:0.2,
+  wrinkle:0.6, wrinkleScale:7, irid:0.25, memWidth:0.3,
+  gravity:0.6, damping:0.92
 };
 const tw=Object.assign({}, DEFAULTS);
 const CONFIG=[
@@ -328,13 +331,14 @@ const CONFIG=[
   {k:'wrinkle', label:'Cloth folds',    min:0,   max:2,    step:0.01},
   {k:'wrinkleScale',label:'Fold scale', min:1,   max:20,   step:0.1},
   {k:'irid',    label:'Iridescence',    min:0,   max:1,    step:0.01},
+  {k:'gravity', label:'Gravity',        min:0,   max:2,    step:0.01},
+  {k:'damping', label:'Momentum',       min:0.7, max:0.99, step:0.005},
   {k:'wave',    label:'Wave / stretch', min:0,   max:1,    step:0.01},
   {k:'waveFreq',label:'Wave frequency', min:20,  max:420,  step:2},
   {k:'thr',     label:'Edge threshold', min:0.5, max:1.8,  step:0.01},
   {k:'rim',     label:'Rim glow',       min:0,   max:2,    step:0.01},
   {k:'size',    label:'Blob size',      min:0.4, max:2.5,  step:0.01},
-  {k:'memWidth',label:'Membrane width', min:0.15,max:1.4,  step:0.01},
-  {k:'sag',     label:'Sag / droop',    min:0,   max:1.5,  step:0.01},
+  {k:'memWidth',label:'Membrane width', min:0.12,max:1.0,  step:0.01},
   {k:'palm',    label:'Palm radius',    min:0.2, max:1.1,  step:0.01},
   {k:'tip',     label:'Finger radius',  min:0.05,max:0.6,  step:0.01},
   {k:'follow',  label:'Follow smoothing',min:0.04,max:0.6, step:0.01},
@@ -407,42 +411,71 @@ function handInfo(lm){
   return {palm,span,tips,open};
 }
 
-// single hand -> blob in the palm with fingertip lobes
-function lobesFromHand(lm){
-  const H=handInfo(lm), palm=H.palm, span=H.span, aspect=cvs.width/cvs.height;
-  const pos=[[0,0]], r=[tw.palm*span*tw.size];     // palm core lobe
-  H.tips.forEach(s=>{                              // fingertip lobes — glass drips to the fingers
-    pos.push([(s.x-palm.x)*aspect, (s.yUp-palm.yUp)]); r.push(tw.tip*span*tw.size);
-  });
-  const wave=Math.max(0,Math.min(1,(H.open/span-0.55)/0.5));
-  return {pointer:{x:palm.x,y:palm.yUp}, pos, r, n:pos.length, wave, stretch:[0,1], two:0};
+// ---- Verlet cloth/strand sim (mass-spring idea borrowed from three.js compute-cloth,
+//      run as a light 2D chain in screen space; endpoints pinned to the palms) ----
+let sim=null;  // {mode, nodes:[{x,y,px,py,pin}], links:[[i,j,rest]]}
+function makeSim(mode, an){
+  const nodes=[], links=[];
+  if(mode==='two'){
+    const A=an.A, B=an.B, K=8;
+    for(let i=0;i<=K;i++){ const u=i/K, x=A.x+(B.x-A.x)*u, y=A.yUp+(B.yUp-A.yUp)*u;
+      nodes.push({x,y,px:x,py:y,pin:(i===0?'A':(i===K?'B':null))}); }
+    const rest=Math.hypot(B.x-A.x,B.yUp-A.yUp)/K;
+    for(let i=0;i<K;i++) links.push([i,i+1,rest]);
+    for(let i=0;i<K-1;i++) links.push([i,i+2,rest*2]);   // bend resistance -> smoother drape
+  } else {                                               // one hand -> a drip strand hangs from the palm
+    const A=an.A, M=5, seg=an.span*0.34;
+    for(let i=0;i<=M;i++){ const x=A.x, y=A.yUp-seg*i; nodes.push({x,y,px:x,py:y,pin:(i===0?'A':null)}); }
+    for(let i=0;i<M;i++) links.push([i,i+1,seg]);
+  }
+  return {mode,nodes,links};
+}
+function stepSim(an){
+  if(!sim) return;
+  const g=tw.gravity*0.00045, damp=tw.damping;
+  for(const n of sim.nodes){
+    if(n.pin){ const a=an[n.pin]; n.x=a.x; n.y=a.yUp; n.px=a.x; n.py=a.yUp; continue; }
+    const vx=(n.x-n.px)*damp, vy=(n.y-n.py)*damp;
+    n.px=n.x; n.py=n.y; n.x+=vx; n.y+=vy-g;              // gravity pulls -y (down in y-up)
+  }
+  for(let it=0;it<4;it++){
+    for(const L of sim.links){
+      const a=sim.nodes[L[0]], b=sim.nodes[L[1]], rest=L[2];
+      let dx=b.x-a.x, dy=b.y-a.y; const d=Math.hypot(dx,dy)||1e-4, k=(d-rest)/d*0.5;
+      dx*=k; dy*=k;
+      if(!a.pin){ a.x+=dx; a.y+=dy; } if(!b.pin){ b.x-=dx; b.y-=dy; }
+    }
+    for(const n of sim.nodes){ if(n.pin){ const a=an[n.pin]; n.x=a.x; n.y=a.yUp; } }
+  }
 }
 
-// two hands -> a membrane/cloth stretched between the palms, sagging when close
-function lobesTwoHands(lmA,lmB){
-  let A=handInfo(lmA), B=handInfo(lmB);
-  if(A.palm.x>B.palm.x){ const tmp=A; A=B; B=tmp; }      // order left -> right
-  const aspect=cvs.width/cvs.height;
-  const M={x:(A.palm.x+B.palm.x)/2, yUp:(A.palm.yUp+B.palm.yUp)/2};
+// single hand -> palm blob + fingertip lobes + the simulated drip strand
+function lobesOneHand(an){
+  const aspect=cvs.width/cvs.height, palm=an.A, span=an.span, fings=an.fingsA;
+  const pos=[[0,0]], r=[tw.palm*span*tw.size];
+  if(fings) fings.forEach(s=>{ pos.push([(s.x-palm.x)*aspect,(s.yUp-palm.yUp)]); r.push(tw.tip*span*tw.size); });
+  if(sim) for(let i=1;i<sim.nodes.length;i++){ const n=sim.nodes[i];
+    pos.push([(n.x-palm.x)*aspect,(n.y-palm.yUp)]); r.push(tw.tip*span*tw.size*0.7); }
+  let open=0; if(fings){ fings.forEach(s=>open+=Math.hypot(s.x-palm.x,s.yUp-palm.yUp)); open/=fings.length; }
+  const wave=Math.max(tw.wave, Math.min(1,(open/span-0.55)/0.5));
+  return {pointer:{x:palm.x,y:palm.yUp}, pos, r, n:Math.min(pos.length,16), wave, stretch:[0,1], two:0};
+}
+
+// two hands -> the simulated sheet/membrane stretched between the palms
+function lobesTwoHands(an){
+  const aspect=cvs.width/cvs.height, A=an.A, B=an.B;
+  const M={x:(A.x+B.x)/2, yUp:(A.yUp+B.yUp)/2};
   const toNdc=s=>[(s.x-M.x)*aspect,(s.yUp-M.yUp)];
-  let dx=(B.palm.x-A.palm.x)*aspect, dy=(B.palm.yUp-A.palm.yUp);
-  const dist=Math.hypot(dx,dy)||0.2; dx/=dist; dy/=dist;
-  const avgSpan=(A.span+B.span)/2;
-  const taut=Math.min(1, dist/(avgSpan*4.5));            // 0 hands together -> 1 far apart
-  const sag=(1-taut)*dist*0.6*tw.sag;                    // mid dips down when slack
-  const width=tw.memWidth*avgSpan*tw.size;
-  const pos=[toNdc(A.palm), toNdc(B.palm)];
-  const r=[0.5*A.span*tw.size, 0.5*B.span*tw.size];
-  const K=7;                                             // connector chain forms the sheet
-  for(let i=1;i<K;i++){
-    const u=i/K;
-    const sx=A.palm.x+(B.palm.x-A.palm.x)*u;
-    const sy=A.palm.yUp+(B.palm.yUp-A.palm.yUp)*u - sag*Math.sin(Math.PI*u);
-    pos.push([(sx-M.x)*aspect,(sy-M.yUp)]); r.push(width);
-  }
-  [A,B].forEach(Hh=>{ [0,1].forEach(ti=>{ const s=Hh.tips[ti]; pos.push(toNdc(s)); r.push(0.18*Hh.span*tw.size); }); });
-  const wave=Math.max(tw.wave, taut);                    // tauter -> more banding/stretch
-  return {pointer:{x:M.x,y:M.yUp}, pos, r, n:Math.min(pos.length,16), wave, stretch:[dx,dy], two:1};
+  const width=tw.memWidth*an.span*tw.size;
+  const pos=[[(A.x-M.x)*aspect,(A.yUp-M.yUp)],[(B.x-M.x)*aspect,(B.yUp-M.yUp)]];
+  const r=[0.42*an.spanA*tw.size, 0.42*an.spanB*tw.size];
+  if(sim) for(let i=1;i<sim.nodes.length-1;i++){ const n=sim.nodes[i];
+    pos.push([(n.x-M.x)*aspect,(n.y-M.yUp)]); r.push(width); }
+  if(an.fingsA) [0,1].forEach(ti=>{ const s=an.fingsA[ti]; pos.push(toNdc(s)); r.push(0.16*an.spanA*tw.size); });
+  if(an.fingsB) [0,1].forEach(ti=>{ const s=an.fingsB[ti]; pos.push(toNdc(s)); r.push(0.16*an.spanB*tw.size); });
+  let dx=(B.x-A.x)*aspect, dy=(B.yUp-A.yUp); const Ld=Math.hypot(dx,dy)||1; dx/=Ld; dy/=Ld;
+  const dist=Math.hypot((B.x-A.x)*aspect,B.yUp-A.yUp), taut=Math.min(1,dist/(an.span*4.5));
+  return {pointer:{x:M.x,y:M.yUp}, pos, r, n:Math.min(pos.length,16), wave:Math.max(tw.wave,taut), stretch:[dx,dy], two:1};
 }
 
 // procedural orbiting lobes around the cursor (no-hand fallback)
@@ -494,35 +527,55 @@ function frame(now){
   if(source==='cam'||source==='reel') uploadVideo();
   const t=(now-t0)/1000;
 
-  // run hand detection ONLY when a fresh camera frame is available
+  // detection only on fresh camera frames -> update anchor TARGETS, mode, fingertips
   if(handOn && handLandmarker && source==='cam' && video && video.readyState>=2 && video.currentTime!==lastVideoTime){
     lastVideoTime=video.currentTime;
     const res=handLandmarker.detectForVideo(video, now);
     if(res.landmarks && res.landmarks.length){
-      lastHands=res.landmarks;
-      lastLandmarks=res.landmarks[0];
-      const two=res.landmarks.length>=2;
-      const h=two ? lobesTwoHands(res.landmarks[0],res.landmarks[1]) : lobesFromHand(res.landmarks[0]);
-      if(!smoothHand) smoothHand={x:h.pointer.x,y:h.pointer.y};
-      smoothHand.x+=(h.pointer.x-smoothHand.x)*0.5;
-      smoothHand.y+=(h.pointer.y-smoothHand.y)*0.5;
-      target.x=smoothHand.x; target.y=smoothHand.y;
-      lastHandLobes=h; lastHandWave=h.wave; handSeenAt=t;
-      setStatus(two ? '✋✋ membrane stretched between hands' : '✋ hand locked · '+(h.wave>0.5?'open/stretchy':'closed'));
+      lastHands=res.landmarks; handSeenAt=t;
+      if(res.landmarks.length>=2){
+        let A=handInfo(res.landmarks[0]), B=handInfo(res.landmarks[1]);
+        if(A.palm.x>B.palm.x){ const m=A; A=B; B=m; }   // order left -> right
+        tA=A.palm; tB=B.palm; spanA=A.span; spanB=B.span; span=(A.span+B.span)/2;
+        fingsA=A.tips; fingsB=B.tips; lastTwoAt=t;
+        if(curMode!=='two'){ curMode='two'; needRebuild=true; }
+      } else if(curMode==='two' && (t-lastTwoAt)<0.35){
+        // brief one-hand dropout mid-membrane -> hold the sheet on its last anchors
+      } else {
+        const H=handInfo(res.landmarks[0]);
+        tA=H.palm; span=spanA=H.span; fingsA=H.tips; fingsB=null;
+        if(curMode!=='one'){ curMode='one'; needRebuild=true; }
+      }
     }
   }
 
-  // grace window: keep using the last hand result between detections so nothing blinks
+  // grace window: keep simulating off the last anchors so nothing blinks
   handFresh = handOn && source==='cam' && (t-handSeenAt)<0.5;
-  if(!handFresh){ lastLandmarks=null; lastHands=[]; if(source==='cam') setStatus(handOn?'show a hand ✋ (or two)':'cursor mode'); }
+  if(!handFresh){ lastHands=[]; curMode=null; sim=null; anchorA=anchorB=null;
+    if(source==='cam') setStatus(handOn?'show a hand ✋ (or two)':'cursor mode'); }
+
+  let lobes, wave, stretch=[0,1], two=0;
+  if(handFresh && curMode){
+    if(!anchorA) anchorA={x:tA.x,yUp:tA.yUp};
+    anchorA.x+=(tA.x-anchorA.x)*0.5; anchorA.yUp+=(tA.yUp-anchorA.yUp)*0.5;
+    const an={A:anchorA, span, spanA, spanB, fingsA, fingsB};
+    if(curMode==='two'){
+      if(!anchorB) anchorB={x:tB.x,yUp:tB.yUp};
+      anchorB.x+=(tB.x-anchorB.x)*0.5; anchorB.yUp+=(tB.yUp-anchorB.yUp)*0.5;
+      an.B=anchorB;
+    }
+    if(needRebuild || !sim || sim.mode!==curMode){ sim=makeSim(curMode,an); needRebuild=false; }
+    stepSim(an);
+    lobes = curMode==='two' ? lobesTwoHands(an) : lobesOneHand(an);
+    wave=lobes.wave; stretch=lobes.stretch; two=lobes.two;
+    target.x=lobes.pointer.x; target.y=lobes.pointer.y;
+    setStatus(curMode==='two' ? '✋✋ membrane between hands' : '✋ hand locked · dripping');
+  } else {
+    lobes=lobesProcedural(t); wave=tw.wave; stretch=lobes.stretch;
+  }
 
   if(!frozen){ pointer.x+=(target.x-pointer.x)*tw.follow; pointer.y+=(target.y-pointer.y)*tw.follow; }
-
-  let lobes, wave;
-  if(handFresh && lastHandLobes){ lobes=lastHandLobes; wave=Math.max(tw.wave,lastHandWave); }
-  else { lobes=lobesProcedural(t); wave=tw.wave; }
   lastLobes=lobes;
-  const stretch=lobes.stretch||[0,1], two=lobes.two||0;
 
   const flatPos=new Float32Array(32), flatR=new Float32Array(16);
   for(let i=0;i<lobes.n;i++){ flatPos[i*2]=lobes.pos[i][0]; flatPos[i*2+1]=lobes.pos[i][1]; flatR[i]=lobes.r[i]; }
