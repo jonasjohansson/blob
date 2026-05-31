@@ -272,6 +272,8 @@ async function initHands(){
 // ---- interaction ----
 let pointer={x:.5,y:.5}, target={x:.5,y:.5}, frozen=false, debug=true;
 let lastLandmarks=null, lastLobes=null;
+// persisted hand result — reused between detections (render fps > camera fps) so the blob doesn't flicker
+let lastHandLobes=null, lastHandWave=0, handSeenAt=-10, handFresh=false;
 
 // ---- tweakable parameters (driven by the slider panel) ----
 const tw={
@@ -419,7 +421,7 @@ function frame(now){
   if(source==='cam'||source==='reel') uploadVideo();
   const t=(now-t0)/1000;
 
-  let lobes=null, wave=tw.wave;
+  // run hand detection ONLY when a fresh camera frame is available
   if(handOn && handLandmarker && source==='cam' && video && video.readyState>=2 && video.currentTime!==lastVideoTime){
     lastVideoTime=video.currentTime;
     const res=handLandmarker.detectForVideo(video, now);
@@ -430,17 +432,20 @@ function frame(now){
       smoothHand.x+=(h.pointer.x-smoothHand.x)*0.5;
       smoothHand.y+=(h.pointer.y-smoothHand.y)*0.5;
       target.x=smoothHand.x; target.y=smoothHand.y;
-      lobes=h; wave=Math.max(tw.wave,h.wave);
+      lastHandLobes=h; lastHandWave=h.wave; handSeenAt=t;
       setStatus('✋ hand locked · '+(h.wave>0.5?'open/stretchy':'closed'));
-    } else {
-      lastLandmarks=null;
-      setStatus('show a hand ✋');
     }
   }
 
+  // grace window: keep using the last hand result between detections so nothing blinks
+  handFresh = handOn && source==='cam' && (t-handSeenAt)<0.5;
+  if(!handFresh){ lastLandmarks=null; if(source==='cam') setStatus(handOn?'show a hand ✋':'cursor mode'); }
+
   if(!frozen){ pointer.x+=(target.x-pointer.x)*tw.follow; pointer.y+=(target.y-pointer.y)*tw.follow; }
 
-  if(!lobes){ const p=lobesProcedural(t); lobes={pos:p.pos, r:p.r, n:p.n}; }
+  let lobes, wave;
+  if(handFresh && lastHandLobes){ lobes=lastHandLobes; wave=Math.max(tw.wave,lastHandWave); }
+  else { lobes=lobesProcedural(t); wave=tw.wave; }
   lastLobes=lobes;
 
   const flatPos=new Float32Array(12), flatR=new Float32Array(6);
