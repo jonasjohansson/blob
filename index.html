@@ -325,12 +325,12 @@ let lastLandmarks=null, lastHands=[], lastLobes=null;
 // persisted hand state — anchors are eased palm targets; the verlet sim runs every
 // render frame off them, so motion stays smooth between detections (and doesn't flicker)
 let handSeenAt=-10, handFresh=false, curMode=null, needRebuild=false, lastTwoAt=-10;
-let anchorA=null, anchorB=null, tA=null, tB=null, spanA=0.2, spanB=0.2, span=0.2, fingsA=null, fingsB=null;
+let anchorA=null, anchorB=null, tA=null, tB=null, spanA=0.2, spanB=0.2, span=0.2, fingsA=null, fingsB=null, mcpsA=null, mcpsB=null;
 
 // ---- tweakable parameters (driven by the slider panel) ----
 const DEFAULTS={
   refract:0.11, disp:0.06, wave:0.0, waveFreq:200, thr:1.0, rim:1.0,
-  size:0.9, palm:0.5, tip:0.2, follow:0.2,
+  size:0.9, palm:0.72, tip:0.22, follow:0.2,
   wrinkle:0.6, wrinkleScale:7, irid:0.25, memWidth:0.3,
   gravity:0.6, damping:0.92, cohesion:0.08
 };
@@ -446,8 +446,9 @@ function handInfo(lm){
   const wrist=lmToScreen(lm[0].x,lm[0].y), midTip=lmToScreen(lm[12].x,lm[12].y);
   const span=Math.hypot(midTip.x-wrist.x,midTip.yUp-wrist.yUp)||0.2;
   const tips=[4,8,12,16,20].map(i=>lmToScreen(lm[i].x,lm[i].y));
+  const mcps=[5,9,13,17].map(i=>lmToScreen(lm[i].x,lm[i].y)); // knuckles — stay clustered near the palm
   let open=0; tips.forEach(s=>open+=Math.hypot(s.x-palm.x,s.yUp-palm.yUp)); open/=tips.length;
-  return {palm,span,tips,open};
+  return {palm,span,tips,mcps,open};
 }
 
 // ---- Verlet cloth/strand sim (mass-spring idea borrowed from three.js compute-cloth,
@@ -488,15 +489,16 @@ function stepSim(an){
   }
 }
 
-// single hand -> palm blob + fingertip lobes + the simulated drip strand
+// single hand -> one connected slime over palm+knuckles, plus the simulated drip strand
 function lobesOneHand(an){
-  const aspect=cvs.width/cvs.height, palm=an.A, span=an.span, fings=an.fingsA;
-  const pos=[[0,0]], r=[tw.palm*span*tw.size];
-  if(fings) fings.forEach(s=>{ pos.push([(s.x-palm.x)*aspect,(s.yUp-palm.yUp)]); r.push(tw.tip*span*tw.size); });
+  const aspect=cvs.width/cvs.height, palm=an.A, span=an.span;
+  const pos=[[0,0]], r=[tw.palm*span*tw.size];                  // palm core (covers the hand)
+  if(an.mcpsA) an.mcpsA.forEach(s=>{                            // knuckle lobes — close to palm so they always merge
+    pos.push([(s.x-palm.x)*aspect,(s.yUp-palm.yUp)]); r.push(tw.tip*span*tw.size*1.5); });
   if(sim) for(let i=1;i<sim.nodes.length;i++){ const n=sim.nodes[i], pv=sim.nodes[i-1];
     const seg=Math.hypot((n.x-pv.x)*aspect,(n.y-pv.y));
-    pos.push([(n.x-palm.x)*aspect,(n.y-palm.yUp)]); r.push(Math.max(tw.tip*span*tw.size*0.7, seg*0.7)); }
-  let open=0; if(fings){ fings.forEach(s=>open+=Math.hypot(s.x-palm.x,s.yUp-palm.yUp)); open/=fings.length; }
+    pos.push([(n.x-palm.x)*aspect,(n.y-palm.yUp)]); r.push(Math.max(tw.tip*span*tw.size, seg*0.7)); }
+  let open=0; if(an.fingsA){ an.fingsA.forEach(s=>open+=Math.hypot(s.x-palm.x,s.yUp-palm.yUp)); open/=an.fingsA.length; }
   const wave=Math.max(tw.wave, Math.min(1,(open/span-0.55)/0.5));
   return {pointer:{x:palm.x,y:palm.yUp}, pos, r, n:Math.min(pos.length,16), wave, stretch:[0,1], two:0};
 }
@@ -512,8 +514,6 @@ function lobesTwoHands(an){
   if(sim) for(let i=1;i<sim.nodes.length-1;i++){ const n=sim.nodes[i], nx=sim.nodes[i+1];
     const seg=Math.hypot((nx.x-n.x)*aspect,(nx.y-n.y));   // keep radius >= spacing so lobes overlap
     pos.push([(n.x-M.x)*aspect,(n.y-M.yUp)]); r.push(Math.max(width, seg*0.75)); }
-  if(an.fingsA) [0,1].forEach(ti=>{ const s=an.fingsA[ti]; pos.push(toNdc(s)); r.push(0.16*an.spanA*tw.size); });
-  if(an.fingsB) [0,1].forEach(ti=>{ const s=an.fingsB[ti]; pos.push(toNdc(s)); r.push(0.16*an.spanB*tw.size); });
   let dx=(B.x-A.x)*aspect, dy=(B.yUp-A.yUp); const Ld=Math.hypot(dx,dy)||1; dx/=Ld; dy/=Ld;
   const dist=Math.hypot((B.x-A.x)*aspect,B.yUp-A.yUp), taut=Math.min(1,dist/(an.span*4.5));
   return {pointer:{x:M.x,y:M.yUp}, pos, r, n:Math.min(pos.length,16), wave:Math.max(tw.wave,taut), stretch:[dx,dy], two:1};
@@ -578,13 +578,13 @@ function frame(now){
         let A=handInfo(res.landmarks[0]), B=handInfo(res.landmarks[1]);
         if(A.palm.x>B.palm.x){ const m=A; A=B; B=m; }   // order left -> right
         tA=A.palm; tB=B.palm; spanA=A.span; spanB=B.span; span=(A.span+B.span)/2;
-        fingsA=A.tips; fingsB=B.tips; lastTwoAt=t;
+        fingsA=A.tips; fingsB=B.tips; mcpsA=A.mcps; mcpsB=B.mcps; lastTwoAt=t;
         if(curMode!=='two'){ curMode='two'; needRebuild=true; }
       } else if(curMode==='two' && (t-lastTwoAt)<0.35){
         // brief one-hand dropout mid-membrane -> hold the sheet on its last anchors
       } else {
         const H=handInfo(res.landmarks[0]);
-        tA=H.palm; span=spanA=H.span; fingsA=H.tips; fingsB=null;
+        tA=H.palm; span=spanA=H.span; fingsA=H.tips; mcpsA=H.mcps; fingsB=null;
         if(curMode!=='one'){ curMode='one'; needRebuild=true; }
       }
     }
@@ -599,7 +599,7 @@ function frame(now){
   if(handFresh && curMode){
     if(!anchorA) anchorA={x:tA.x,yUp:tA.yUp};
     anchorA.x+=(tA.x-anchorA.x)*0.5; anchorA.yUp+=(tA.yUp-anchorA.yUp)*0.5;
-    const an={A:anchorA, span, spanA, spanB, fingsA, fingsB};
+    const an={A:anchorA, span, spanA, spanB, fingsA, fingsB, mcpsA, mcpsB};
     if(curMode==='two'){
       if(!anchorB) anchorB={x:tB.x,yUp:tB.yUp};
       anchorB.x+=(tB.x-anchorB.x)*0.5; anchorB.yUp+=(tB.yUp-anchorB.yUp)*0.5;
