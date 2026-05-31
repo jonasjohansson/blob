@@ -21,6 +21,8 @@
          border-radius:8px;padding:6px 10px;cursor:pointer}
   button:hover{background:rgba(191,227,168,.2)}
   button.active{background:var(--accent);color:#0b0d0a;border-color:var(--accent)}
+  #recbtn.rec{background:#ff4d4d;border-color:#ff4d4d;color:#fff;animation:pulse 1s infinite}
+  @keyframes pulse{50%{opacity:.55}}
   #status{margin-top:8px;font-size:11px;color:var(--accent)}
   .panel{position:fixed;right:14px;top:14px;z-index:11;width:230px;font-size:11px;color:var(--fg);
          background:rgba(8,12,8,.55);backdrop-filter:blur(6px);border:1px solid rgba(191,227,168,.18);border-radius:10px;padding:10px 12px}
@@ -50,6 +52,7 @@
     <button id="hand" class="active">✋ Hand tracking</button>
     <button id="skelbtn" class="active">🦴 Skeleton</button>
     <button id="freeze">⏸ Freeze</button>
+    <button id="recbtn">● Record</button>
   </div>
   <div id="status">starting…</div>
 </div>
@@ -92,6 +95,7 @@ uniform float u_two;           // 1 = membrane stretched between two hands
 uniform float u_wrinkle;       // cloth fold depth
 uniform float u_wrinkleScale;  // cloth fold frequency
 uniform float u_irid;          // thin-film iridescence amount
+uniform float u_smink;         // smooth-union blend radius (surface cohesion)
 
 vec2 coverUV(vec2 frag){
   float ca = u_res.x/u_res.y, ta = u_bgRes.x/u_bgRes.y;
@@ -105,15 +109,20 @@ vec3 sampleBG(vec2 uv){
   return texture2D(u_bg, uv).rgb;
 }
 
-float field(vec2 q){
-  float v = 0.0;
+// smooth-union signed distance field over the lobes — blends them into one cohesive
+// liquid surface so the sheet won't pinch into separate droplets when stretched
+float smin(float a, float b, float k){
+  float h = clamp(0.5 + 0.5*(b-a)/k, 0.0, 1.0);
+  return mix(b, a, h) - k*h*(1.0-h);
+}
+float sceneSDF(vec2 q){
+  float D = 1e3;
   for(int i=0;i<MAXL;i++){
     if(i>=u_nLobes) break;
-    vec2 d = q - u_lobePos[i];
-    float r = u_lobeR[i];
-    v += (r*r)/max(dot(d,d),1e-5);
+    float di = length(q - u_lobePos[i]) - u_lobeR[i]; // circle SDF (negative inside)
+    D = smin(D, di, u_smink);
   }
-  return v;
+  return D;
 }
 
 // value noise + ridged folds for the cloth wrinkles
@@ -135,15 +144,16 @@ void main(){
   vec2 ndc = (frag/u_res - u_pointer);
   ndc.x *= aspect;
 
-  float thr = u_thr;
-  float f = field(ndc);
-  float thickness = smoothstep(thr*0.85, thr*1.9, f);
-  float inside = smoothstep(thr*0.92, thr*1.05, f);
+  float iso = (u_thr-1.0)*0.12;             // edge threshold now inflates/deflates the surface
+  float D = sceneSDF(ndc) - iso;
+  float depth = -D;                          // > 0 inside the surface
+  float thickness = smoothstep(0.0, 0.05, depth);
+  float inside = smoothstep(0.0, 0.008, depth);
 
   float e = 0.0016;
-  float fx = field(ndc+vec2(e,0.)) - field(ndc-vec2(e,0.));
-  float fy = field(ndc+vec2(0.,e)) - field(ndc-vec2(0.,e));
-  vec2 sn = normalize(vec2(fx,fy)+1e-5);  // blob silhouette normal
+  float fx = sceneSDF(ndc+vec2(e,0.)) - sceneSDF(ndc-vec2(e,0.));
+  float fy = sceneSDF(ndc+vec2(0.,e)) - sceneSDF(ndc-vec2(0.,e));
+  vec2 sn = -normalize(vec2(fx,fy)+1e-5);   // inward normal (SDF grad points outward)
 
   // ---- cloth wrinkles: ridged folds running ALONG the stretch direction ----
   vec2 sd = normalize(u_stretch + vec2(1e-4, 1.0e-4));
@@ -187,7 +197,7 @@ void main(){
   vec3 irid = 0.5 + 0.5*cos(6.2831*(phase + vec3(0.0,0.33,0.67)));
   outc += irid*u_irid*(rim*0.7 + foldEdge*0.5*clothAmt)*inside;
 
-  float edge = smoothstep(thr*0.95, thr*1.02, f)*(1.0 - smoothstep(thr*1.02, thr*1.25, f));
+  float edge = smoothstep(0.012, 0.0, abs(D));   // bright band straddling the surface
   outc += edge*vec3(0.9,1.0,0.85)*0.55*u_rim;
   outc += rim*vec3(0.12,0.16,0.10)*u_rim;
   outc *= 1.0 - edge*0.15;
@@ -230,7 +240,7 @@ const u={res:U('u_res'),time:U('u_time'),pointer:U('u_pointer'),bg:U('u_bg'),bgR
   nLobes:U('u_nLobes'),lobePos:U('u_lobePos'),lobeR:U('u_lobeR'),
   disp:U('u_disp'),refract:U('u_refract'),wave:U('u_wave'),mirror:U('u_mirror'),
   waveFreq:U('u_waveFreq'),thr:U('u_thr'),rim:U('u_rim'),
-  stretch:U('u_stretch'),two:U('u_two'),wrinkle:U('u_wrinkle'),wrinkleScale:U('u_wrinkleScale'),irid:U('u_irid')};
+  stretch:U('u_stretch'),two:U('u_two'),wrinkle:U('u_wrinkle'),wrinkleScale:U('u_wrinkleScale'),irid:U('u_irid'),smink:U('u_smink')};
 
 // ---- texture ----
 const tex=gl.createTexture();
@@ -322,7 +332,7 @@ const DEFAULTS={
   refract:0.11, disp:0.06, wave:0.0, waveFreq:200, thr:1.0, rim:1.0,
   size:0.9, palm:0.5, tip:0.2, follow:0.2,
   wrinkle:0.6, wrinkleScale:7, irid:0.25, memWidth:0.3,
-  gravity:0.6, damping:0.92
+  gravity:0.6, damping:0.92, cohesion:0.08
 };
 const tw=Object.assign({}, DEFAULTS);
 const CONFIG=[
@@ -339,6 +349,7 @@ const CONFIG=[
   {k:'rim',     label:'Rim glow',       min:0,   max:2,    step:0.01},
   {k:'size',    label:'Blob size',      min:0.4, max:2.5,  step:0.01},
   {k:'memWidth',label:'Membrane width', min:0.12,max:1.0,  step:0.01},
+  {k:'cohesion',label:'Cohesion',       min:0.01,max:0.25, step:0.005},
   {k:'palm',    label:'Palm radius',    min:0.2, max:1.1,  step:0.01},
   {k:'tip',     label:'Finger radius',  min:0.05,max:0.6,  step:0.01},
   {k:'follow',  label:'Follow smoothing',min:0.04,max:0.6, step:0.01},
@@ -374,6 +385,34 @@ const bCam=document.getElementById('src-cam'),bReel=document.getElementById('src
 const bHand=document.getElementById('hand'),bFreeze=document.getElementById('freeze'),bSkel=document.getElementById('skelbtn');
 const skel=document.getElementById('skel'), sctx=skel.getContext('2d');
 bSkel.onclick=()=>{debug=!debug;bSkel.classList.toggle('active',debug);skel.classList.toggle('on',debug);};
+
+// ---- record the canvas (effect only, no skeleton) to a .webm ----
+const bRec=document.getElementById('recbtn');
+let recorder=null, recChunks=[];
+bRec.onclick=()=>{
+  if(recorder){ recorder.stop(); return; }
+  const types=['video/webm;codecs=vp9','video/webm;codecs=vp8','video/webm'];
+  const mime=types.find(t=>window.MediaRecorder&&MediaRecorder.isTypeSupported(t));
+  if(!mime){ setStatus('recording not supported in this browser'); return; }
+  const wasDebug=debug; if(debug){ debug=false; skel.classList.remove('on'); } // keep skeleton out of the clip
+  const stream=cvs.captureStream(60);
+  recChunks=[];
+  recorder=new MediaRecorder(stream,{mimeType:mime,videoBitsPerSecond:12_000_000});
+  recorder.ondataavailable=e=>{ if(e.data.size) recChunks.push(e.data); };
+  recorder.onstop=()=>{
+    const blob=new Blob(recChunks,{type:'video/webm'});
+    const a=document.createElement('a');
+    const ts=new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+    a.href=URL.createObjectURL(blob); a.download='glass-blob-'+ts+'.webm';
+    a.click(); setTimeout(()=>URL.revokeObjectURL(a.href),1000);
+    recorder=null; bRec.classList.remove('rec'); bRec.textContent='● Record';
+    if(wasDebug){ debug=true; skel.classList.add('on'); }
+    setStatus('saved '+a.download);
+  };
+  recorder.start();
+  bRec.classList.add('rec'); bRec.textContent='■ Stop';
+  setStatus('● recording… click Stop to save');
+};
 function pickSource(btn){[bCam,bReel,bFor].forEach(b=>b.classList.remove('active'));btn.classList.add('active');}
 bCam.onclick=()=>{pickSource(bCam);startCam();};
 bReel.onclick=()=>{pickSource(bReel);startReel();};
@@ -454,8 +493,9 @@ function lobesOneHand(an){
   const aspect=cvs.width/cvs.height, palm=an.A, span=an.span, fings=an.fingsA;
   const pos=[[0,0]], r=[tw.palm*span*tw.size];
   if(fings) fings.forEach(s=>{ pos.push([(s.x-palm.x)*aspect,(s.yUp-palm.yUp)]); r.push(tw.tip*span*tw.size); });
-  if(sim) for(let i=1;i<sim.nodes.length;i++){ const n=sim.nodes[i];
-    pos.push([(n.x-palm.x)*aspect,(n.y-palm.yUp)]); r.push(tw.tip*span*tw.size*0.7); }
+  if(sim) for(let i=1;i<sim.nodes.length;i++){ const n=sim.nodes[i], pv=sim.nodes[i-1];
+    const seg=Math.hypot((n.x-pv.x)*aspect,(n.y-pv.y));
+    pos.push([(n.x-palm.x)*aspect,(n.y-palm.yUp)]); r.push(Math.max(tw.tip*span*tw.size*0.7, seg*0.7)); }
   let open=0; if(fings){ fings.forEach(s=>open+=Math.hypot(s.x-palm.x,s.yUp-palm.yUp)); open/=fings.length; }
   const wave=Math.max(tw.wave, Math.min(1,(open/span-0.55)/0.5));
   return {pointer:{x:palm.x,y:palm.yUp}, pos, r, n:Math.min(pos.length,16), wave, stretch:[0,1], two:0};
@@ -469,8 +509,9 @@ function lobesTwoHands(an){
   const width=tw.memWidth*an.span*tw.size;
   const pos=[[(A.x-M.x)*aspect,(A.yUp-M.yUp)],[(B.x-M.x)*aspect,(B.yUp-M.yUp)]];
   const r=[0.42*an.spanA*tw.size, 0.42*an.spanB*tw.size];
-  if(sim) for(let i=1;i<sim.nodes.length-1;i++){ const n=sim.nodes[i];
-    pos.push([(n.x-M.x)*aspect,(n.y-M.yUp)]); r.push(width); }
+  if(sim) for(let i=1;i<sim.nodes.length-1;i++){ const n=sim.nodes[i], nx=sim.nodes[i+1];
+    const seg=Math.hypot((nx.x-n.x)*aspect,(nx.y-n.y));   // keep radius >= spacing so lobes overlap
+    pos.push([(n.x-M.x)*aspect,(n.y-M.yUp)]); r.push(Math.max(width, seg*0.75)); }
   if(an.fingsA) [0,1].forEach(ti=>{ const s=an.fingsA[ti]; pos.push(toNdc(s)); r.push(0.16*an.spanA*tw.size); });
   if(an.fingsB) [0,1].forEach(ti=>{ const s=an.fingsB[ti]; pos.push(toNdc(s)); r.push(0.16*an.spanB*tw.size); });
   let dx=(B.x-A.x)*aspect, dy=(B.yUp-A.yUp); const Ld=Math.hypot(dx,dy)||1; dx/=Ld; dy/=Ld;
@@ -598,6 +639,7 @@ function frame(now){
   gl.uniform1f(u.wrinkle,tw.wrinkle);
   gl.uniform1f(u.wrinkleScale,tw.wrinkleScale);
   gl.uniform1f(u.irid,tw.irid);
+  gl.uniform1f(u.smink,tw.cohesion);
   gl.uniform1f(u.mirror, source==='cam'?1:0);
   gl.uniform1i(u.bg,0);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,tex);
