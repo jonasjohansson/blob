@@ -9,7 +9,9 @@
   *{box-sizing:border-box;margin:0;padding:0}
   html,body{height:100%;background:var(--bg);color:var(--fg);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden}
   #stage{position:fixed;inset:0;display:grid;place-items:center}
-  canvas{width:100vw;height:100vh;display:block;touch-action:none;cursor:crosshair}
+  #gl{width:100vw;height:100vh;display:block;touch-action:none;cursor:crosshair}
+  #skel{position:fixed;inset:0;width:100vw;height:100vh;pointer-events:none;z-index:5;display:none}
+  #skel.on{display:block}
   .hud{position:fixed;left:14px;top:14px;z-index:10;font-size:12px;line-height:1.5;color:var(--muted);
        background:rgba(8,12,8,.45);backdrop-filter:blur(6px);padding:10px 12px;border:1px solid rgba(191,227,168,.18);border-radius:10px;max-width:min(86vw,360px)}
   .hud b{color:var(--fg);font-weight:600}
@@ -20,11 +22,21 @@
   button:hover{background:rgba(191,227,168,.2)}
   button.active{background:var(--accent);color:#0b0d0a;border-color:var(--accent)}
   #status{margin-top:8px;font-size:11px;color:var(--accent)}
+  .panel{position:fixed;right:14px;top:14px;z-index:11;width:230px;font-size:11px;color:var(--fg);
+         background:rgba(8,12,8,.55);backdrop-filter:blur(6px);border:1px solid rgba(191,227,168,.18);border-radius:10px;padding:10px 12px}
+  .panel-head{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;color:var(--muted)}
+  .panel-head b{color:var(--fg)}
+  .panel-head button{padding:2px 8px;font-size:11px;margin-left:6px}
+  .panel.collapsed #tw-rows{display:none}
+  .tw{display:block;margin:7px 0}
+  .tw-head{display:flex;justify-content:space-between;color:var(--muted)}
+  .tw-val{color:var(--accent);font-variant-numeric:tabular-nums}
+  .tw input[type=range]{width:100%;margin-top:3px;accent-color:var(--accent)}
   .err{position:fixed;inset:0;display:none;place-items:center;text-align:center;padding:24px;z-index:20;color:#ffb4b4}
 </style>
 </head>
 <body>
-<div id="stage"><canvas id="gl"></canvas></div>
+<div id="stage"><canvas id="gl"></canvas><canvas id="skel"></canvas></div>
 
 <div class="hud">
   <div><b>Glass Blob</b> — a refractive lens that lives in your hand.</div>
@@ -36,12 +48,18 @@
   </div>
   <div class="row">
     <button id="hand" class="active">✋ Hand tracking</button>
+    <button id="skelbtn" class="active">🦴 Skeleton</button>
     <button id="freeze">⏸ Freeze</button>
   </div>
-  <div class="row" style="margin-top:6px;color:var(--muted)">
-    <span><kbd>D</kbd> dispersion</span><span><kbd>R</kbd> refract</span><span><kbd>W</kbd> wave</span>
-  </div>
   <div id="status">starting…</div>
+</div>
+
+<div class="panel" id="panel">
+  <div class="panel-head">
+    <b>Blob controls</b>
+    <span><button id="tw-reset">reset</button><button id="tw-toggle">–</button></span>
+  </div>
+  <div id="tw-rows"></div>
 </div>
 
 <div class="err" id="err"></div>
@@ -65,6 +83,9 @@ uniform float u_lobeR[MAXL];   // ndc radius
 uniform float u_disp;
 uniform float u_refract;
 uniform float u_wave;          // 0..1 stretch/wave amount
+uniform float u_waveFreq;      // vertical band frequency
+uniform float u_thr;           // metaball edge threshold (blob size/softness)
+uniform float u_rim;           // rim highlight / sheen intensity
 uniform float u_mirror;        // 1 = mirror x (webcam), 0 = as-is (reel/forest)
 
 vec2 coverUV(vec2 frag){
@@ -99,7 +120,7 @@ void main(){
   vec2 ndc = (frag/u_res - u_pointer);
   ndc.x *= aspect;
 
-  float thr = 1.0;
+  float thr = u_thr;
   float f = field(ndc);
   float thickness = smoothstep(thr*0.85, thr*1.9, f);
 
@@ -113,7 +134,7 @@ void main(){
   vec2 off = -n*bend;
 
   // stretchy vertical "liquid glass" banding — grows as the hand opens
-  float band = sin(uv.y*200.0 + t*3.0 + uv.x*6.0);
+  float band = sin(uv.y*u_waveFreq + t*3.0 + uv.x*6.0);
   off += vec2(band*(0.0012 + 0.006*u_wave), 0.0)*thickness;
   off.y += sin(uv.x*60.0 - t*2.0)*(0.001+0.004*u_wave)*thickness;
 
@@ -128,8 +149,8 @@ void main(){
   vec3 outc = mix(bg, col, inside);
 
   float edge = smoothstep(thr*0.95, thr*1.02, f)*(1.0 - smoothstep(thr*1.02, thr*1.25, f));
-  outc += edge*vec3(0.9,1.0,0.85)*0.55;
-  outc += rim*vec3(0.12,0.16,0.10);
+  outc += edge*vec3(0.9,1.0,0.85)*0.55*u_rim;
+  outc += rim*vec3(0.12,0.16,0.10)*u_rim;
   outc *= 1.0 - edge*0.15;
 
   gl_FragColor = vec4(outc,1.0);
@@ -168,7 +189,8 @@ gl.enableVertexAttribArray(ploc); gl.vertexAttribPointer(ploc,2,gl.FLOAT,false,0
 const U=n=>gl.getUniformLocation(prog,n);
 const u={res:U('u_res'),time:U('u_time'),pointer:U('u_pointer'),bg:U('u_bg'),bgRes:U('u_bgRes'),
   nLobes:U('u_nLobes'),lobePos:U('u_lobePos'),lobeR:U('u_lobeR'),
-  disp:U('u_disp'),refract:U('u_refract'),wave:U('u_wave'),mirror:U('u_mirror')};
+  disp:U('u_disp'),refract:U('u_refract'),wave:U('u_wave'),mirror:U('u_mirror'),
+  waveFreq:U('u_waveFreq'),thr:U('u_thr'),rim:U('u_rim')};
 
 // ---- texture ----
 const tex=gl.createTexture();
@@ -248,8 +270,27 @@ async function initHands(){
 }
 
 // ---- interaction ----
-let pointer={x:.5,y:.5}, target={x:.5,y:.5}, frozen=false;
-let params={disp:0.06, refract:0.11, wave:0.0};
+let pointer={x:.5,y:.5}, target={x:.5,y:.5}, frozen=false, debug=true;
+let lastLandmarks=null, lastLobes=null;
+
+// ---- tweakable parameters (driven by the slider panel) ----
+const tw={
+  refract:0.11, disp:0.06, wave:0.0, waveFreq:200, thr:1.0, rim:1.0,
+  size:1.0, palm:0.62, tip:0.26, follow:0.18
+};
+const CONFIG=[
+  {k:'refract', label:'Refraction',     min:0,   max:0.35, step:0.005},
+  {k:'disp',    label:'Dispersion',     min:0,   max:0.30, step:0.005},
+  {k:'wave',    label:'Wave / stretch', min:0,   max:1,    step:0.01},
+  {k:'waveFreq',label:'Wave frequency', min:20,  max:420,  step:2},
+  {k:'thr',     label:'Edge threshold', min:0.5, max:1.8,  step:0.01},
+  {k:'rim',     label:'Rim glow',       min:0,   max:2,    step:0.01},
+  {k:'size',    label:'Blob size',      min:0.4, max:2.5,  step:0.01},
+  {k:'palm',    label:'Palm radius',    min:0.2, max:1.1,  step:0.01},
+  {k:'tip',     label:'Finger radius',  min:0.05,max:0.6,  step:0.01},
+  {k:'follow',  label:'Follow smoothing',min:0.04,max:0.6, step:0.01},
+];
+
 function setPointer(ev){
   const r=cvs.getBoundingClientRect();
   const cx=(ev.touches?ev.touches[0].clientX:ev.clientX)-r.left;
@@ -258,13 +299,29 @@ function setPointer(ev){
 }
 cvs.addEventListener('pointermove',setPointer);
 cvs.addEventListener('touchmove',e=>{e.preventDefault();setPointer(e);},{passive:false});
-addEventListener('keydown',e=>{const k=e.key.toLowerCase();
-  if(k==='d')params.disp=params.disp>0.12?0.02:params.disp+0.03;
-  if(k==='r')params.refract=params.refract>0.18?0.05:params.refract+0.04;
-  if(k==='w')params.wave=params.wave>0.8?0.0:params.wave+0.25;
+
+// build the slider panel
+const panel=document.getElementById('panel'), rowsEl=document.getElementById('tw-rows');
+CONFIG.forEach(c=>{
+  const row=document.createElement('label'); row.className='tw';
+  const name=document.createElement('span'); name.className='tw-name'; name.textContent=c.label;
+  const val=document.createElement('span'); val.className='tw-val'; val.textContent=(+tw[c.k]).toFixed(3);
+  const s=document.createElement('input'); s.type='range'; s.min=c.min; s.max=c.max; s.step=c.step; s.value=tw[c.k];
+  s.oninput=()=>{ tw[c.k]=parseFloat(s.value); val.textContent=(+tw[c.k]).toFixed(3); };
+  c._slider=s; c._val=val;
+  const head=document.createElement('div'); head.className='tw-head'; head.append(name,val);
+  row.append(head,s); rowsEl.appendChild(row);
 });
+document.getElementById('tw-reset').onclick=()=>{
+  const d={refract:0.11,disp:0.06,wave:0.0,waveFreq:200,thr:1.0,rim:1.0,size:1.0,palm:0.62,tip:0.26,follow:0.18};
+  CONFIG.forEach(c=>{ tw[c.k]=d[c.k]; c._slider.value=d[c.k]; c._val.textContent=(+d[c.k]).toFixed(3); });
+};
+document.getElementById('tw-toggle').onclick=()=>panel.classList.toggle('collapsed');
+
 const bCam=document.getElementById('src-cam'),bReel=document.getElementById('src-reel'),bFor=document.getElementById('src-forest');
-const bHand=document.getElementById('hand'),bFreeze=document.getElementById('freeze');
+const bHand=document.getElementById('hand'),bFreeze=document.getElementById('freeze'),bSkel=document.getElementById('skelbtn');
+const skel=document.getElementById('skel'), sctx=skel.getContext('2d');
+bSkel.onclick=()=>{debug=!debug;bSkel.classList.toggle('active',debug);skel.classList.toggle('on',debug);};
 function pickSource(btn){[bCam,bReel,bFor].forEach(b=>b.classList.remove('active'));btn.classList.add('active');}
 bCam.onclick=()=>{pickSource(bCam);startCam();};
 bReel.onclick=()=>{pickSource(bReel);startReel();};
@@ -275,16 +332,19 @@ bFreeze.onclick=()=>{frozen=!frozen;bFreeze.classList.toggle('active',frozen);};
 function resize(){
   const dpr=Math.min(devicePixelRatio||1,2);
   cvs.width=Math.floor(innerWidth*dpr); cvs.height=Math.floor(innerHeight*dpr);
+  skel.width=innerWidth; skel.height=innerHeight;
   gl.viewport(0,0,cvs.width,cvs.height);
 }
 addEventListener('resize',resize); resize();
+if(debug) skel.classList.add('on');
 
-// map a raw-camera landmark (x L->R, y top->down) to mirrored screen space (x L->R, y UP)
+// map a raw-camera landmark (x L->R, y top->down) onto the displayed (mirrored,
+// cover-fit) frame. x is MIRRORED to match the selfie view the shader renders.
 function lmToScreen(lx,ly){
   const ca=cvs.width/cvs.height, ta=bgW/bgH;
-  let cx=lx-0.5, cy=ly-0.5;
+  let cx=0.5-lx, cy=0.5-ly;           // 0.5-lx mirrors x; 0.5-ly flips to y-up
   if(ca>ta) cy*=ca/ta; else cx*=ta/ca;
-  return { x:cx+0.5, yUp:1-(cy+0.5) };
+  return { x:cx+0.5, yUp:cy+0.5 };
 }
 
 // build lobe arrays from hand landmarks; returns {pointer, pos[], r[], n, wave}
@@ -298,12 +358,12 @@ function lobesFromHand(lm){
   const aspect=cvs.width/cvs.height;
   const tips=[4,8,12,16,20];
   const pos=[], r=[];
-  pos.push([0,0]); r.push(0.62*span);            // palm core lobe
+  pos.push([0,0]); r.push(tw.palm*span*tw.size);  // palm core lobe
   let open=0;
   for(const ti of tips){                          // fingertip lobes — glass drips to the fingers
     const s=lmToScreen(lm[ti].x,lm[ti].y);
     const dx=(s.x-palm.x)*aspect, dy=(s.yUp-palm.yUp);
-    pos.push([dx,dy]); r.push(0.26*span);
+    pos.push([dx,dy]); r.push(tw.tip*span*tw.size);
     open+=Math.hypot(dx,dy);
   }
   open/=tips.length;
@@ -316,11 +376,42 @@ function lobesProcedural(t){
   const pos=[], r=[]; const N=2;
   for(let i=0;i<N;i++){
     const a=i*2.3+t*(0.6+i*0.25);
-    const orbit=i===0?0.05:0.14;
+    const orbit=(i===0?0.05:0.14)*tw.size;
     pos.push([Math.cos(a)*orbit, Math.sin(a*1.3)*orbit]);
-    r.push(0.17-i*0.03);
+    r.push((0.17-i*0.03)*tw.size);
   }
   return {pos,r,n:N};
+}
+
+// ---- debug skeleton overlay ----
+const HC=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+          [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function toPx(lx,ly){ const s=lmToScreen(lx,ly); return [s.x*skel.width,(1-s.yUp)*skel.height]; }
+function drawSkeleton(){
+  sctx.clearRect(0,0,skel.width,skel.height);
+  if(!debug) return;
+  // lobe coverage circles (cyan) — shows exactly where the glass sits
+  if(lastLobes){
+    const aspect=cvs.width/cvs.height;
+    sctx.strokeStyle='rgba(120,220,255,.6)'; sctx.lineWidth=1.5;
+    for(let i=0;i<lastLobes.n;i++){
+      const xUp=pointer.x+lastLobes.pos[i][0]/aspect, yUp=pointer.y+lastLobes.pos[i][1];
+      sctx.beginPath(); sctx.arc(xUp*skel.width,(1-yUp)*skel.height,Math.abs(lastLobes.r[i])*skel.height,0,7); sctx.stroke();
+    }
+  }
+  if(source==='cam' && lastLandmarks){
+    const lm=lastLandmarks;
+    sctx.strokeStyle='rgba(255,255,255,.85)'; sctx.lineWidth=3;
+    sctx.beginPath();
+    for(const [a,b] of HC){ const pa=toPx(lm[a].x,lm[a].y), pb=toPx(lm[b].x,lm[b].y); sctx.moveTo(pa[0],pa[1]); sctx.lineTo(pb[0],pb[1]); }
+    sctx.stroke();
+    for(let i=0;i<lm.length;i++){ const p=toPx(lm[i].x,lm[i].y); sctx.fillStyle=(i===0?'#ffd166':'#bfe3a8'); sctx.beginPath(); sctx.arc(p[0],p[1],5,0,7); sctx.fill(); }
+  }
+  // palm target the blob actually follows (red crosshair)
+  const px=pointer.x*skel.width, py=(1-pointer.y)*skel.height;
+  sctx.strokeStyle='#ff4d4d'; sctx.lineWidth=2;
+  sctx.beginPath(); sctx.moveTo(px-14,py); sctx.lineTo(px+14,py); sctx.moveTo(px,py-14); sctx.lineTo(px,py+14); sctx.stroke();
+  sctx.beginPath(); sctx.arc(px,py,16,0,7); sctx.stroke();
 }
 
 const t0=performance.now();
@@ -328,26 +419,29 @@ function frame(now){
   if(source==='cam'||source==='reel') uploadVideo();
   const t=(now-t0)/1000;
 
-  let lobes=null, wave=params.wave;
+  let lobes=null, wave=tw.wave;
   if(handOn && handLandmarker && source==='cam' && video && video.readyState>=2 && video.currentTime!==lastVideoTime){
     lastVideoTime=video.currentTime;
     const res=handLandmarker.detectForVideo(video, now);
     if(res.landmarks && res.landmarks.length){
-      const h=lobesFromHand(res.landmarks[0]);
+      lastLandmarks=res.landmarks[0];
+      const h=lobesFromHand(lastLandmarks);
       if(!smoothHand) smoothHand={x:h.pointer.x,y:h.pointer.y};
-      smoothHand.x+=(h.pointer.x-smoothHand.x)*0.4;
-      smoothHand.y+=(h.pointer.y-smoothHand.y)*0.4;
+      smoothHand.x+=(h.pointer.x-smoothHand.x)*0.5;
+      smoothHand.y+=(h.pointer.y-smoothHand.y)*0.5;
       target.x=smoothHand.x; target.y=smoothHand.y;
-      lobes=h; wave=Math.max(params.wave,h.wave);
+      lobes=h; wave=Math.max(tw.wave,h.wave);
       setStatus('✋ hand locked · '+(h.wave>0.5?'open/stretchy':'closed'));
     } else {
+      lastLandmarks=null;
       setStatus('show a hand ✋');
     }
   }
 
-  if(!frozen){ pointer.x+=(target.x-pointer.x)*0.18; pointer.y+=(target.y-pointer.y)*0.18; }
+  if(!frozen){ pointer.x+=(target.x-pointer.x)*tw.follow; pointer.y+=(target.y-pointer.y)*tw.follow; }
 
   if(!lobes){ const p=lobesProcedural(t); lobes={pos:p.pos, r:p.r, n:p.n}; }
+  lastLobes=lobes;
 
   const flatPos=new Float32Array(12), flatR=new Float32Array(6);
   for(let i=0;i<lobes.n;i++){ flatPos[i*2]=lobes.pos[i][0]; flatPos[i*2+1]=lobes.pos[i][1]; flatR[i]=lobes.r[i]; }
@@ -359,13 +453,18 @@ function frame(now){
   gl.uniform1i(u.nLobes,lobes.n);
   gl.uniform2fv(u.lobePos,flatPos);
   gl.uniform1fv(u.lobeR,flatR);
-  gl.uniform1f(u.disp,params.disp);
-  gl.uniform1f(u.refract,params.refract);
+  gl.uniform1f(u.disp,tw.disp);
+  gl.uniform1f(u.refract,tw.refract);
   gl.uniform1f(u.wave,wave);
+  gl.uniform1f(u.waveFreq,tw.waveFreq);
+  gl.uniform1f(u.thr,tw.thr);
+  gl.uniform1f(u.rim,tw.rim);
   gl.uniform1f(u.mirror, source==='cam'?1:0);
   gl.uniform1i(u.bg,0);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D,tex);
   gl.drawArrays(gl.TRIANGLES,0,3);
+
+  drawSkeleton();
   requestAnimationFrame(frame);
 }
 
